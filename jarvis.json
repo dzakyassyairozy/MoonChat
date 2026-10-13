@@ -1,5 +1,5 @@
 {
-  "api_key": "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",
+  "api_key": "Paste-your-api-is-here",
   "api_url": "https://openrouter.ai/api/v1/chat/completions",
   "model": "openai/gpt-4o-mini",
   "max_tokens": 2048,
