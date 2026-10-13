@@ -1,0 +1,314 @@
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+
+async function facebookCommand(sock, chatId, message) {
+    try {
+        const text = message.message?.conversation || message.message?.extendedTextMessage?.text;
+        const url = text.split(' ').slice(1).join(' ').trim();
+        
+        if (!url) {
+            return await sock.sendMessage(chatId, { 
+                text: "Please provide a Facebook video or photo post URL.\nExample: .fb https://www.facebook.com/..."
+            }, { quoted: message });
+        }
+
+        // Validate Facebook URL
+        if (!url.includes('facebook.com')) {
+            return await sock.sendMessage(chatId, { 
+                text: "That is not a Facebook link."
+            }, { quoted: message });
+        }
+
+        // Send loading reaction
+        await sock.sendMessage(chatId, {
+            react: { text: '🔄', key: message.key }
+        });
+
+        // Resolve share/short URLs to their final destination first, and inspect
+        // the post's OG tags to tell a photo post from a video post. Facebook
+        // tags many photo posts as og:type "video.other" too, so the presence
+        // of an actual og:video tag (not og:type) is what we key off of.
+        //
+        // Facebook also serves a stripped-down "no_js"/bot-check interstitial
+        // to non-browser clients sometimes, which only carries og:title/
+        // og:description (no og:image, no og:video at all) - that page is
+        // handled naturally below since it never satisfies ogImages.length>0.
+        //
+        // Tag lookup tolerates either attribute order (property before/after
+        // content) and matches og:video, og:video:url and og:video:secure_url,
+        // since Facebook doesn't consistently emit the same variant for every
+        // video post type.
+        function extractOg(html, propAlt) {
+            const re1 = new RegExp(`<meta[^>]*property=["'](?:${propAlt})["'][^>]*content=["']([^"']+)["']`, 'i');
+            const re2 = new RegExp(`<meta[^>]*content=["']([^"']+)["'][^>]*property=["'](?:${propAlt})["']`, 'i');
+            const m = html.match(re1) || html.match(re2);
+            return m ? m[1].replace(/&amp;/g, '&') : null;
+        }
+        function extractOgAll(html, propAlt) {
+            const re1 = new RegExp(`<meta[^>]*property=["'](?:${propAlt})["'][^>]*content=["']([^"']+)["']`, 'gi');
+            const re2 = new RegExp(`<meta[^>]*content=["']([^"']+)["'][^>]*property=["'](?:${propAlt})["']`, 'gi');
+            const out = [];
+            for (const m of html.matchAll(re1)) out.push(m[1]);
+            for (const m of html.matchAll(re2)) out.push(m[1]);
+            return out.map(s => s.replace(/&amp;/g, '&'));
+        }
+
+        let resolvedUrl = url;
+        let ogVideoUrl = null;
+        let ogImages = [];
+        let ogTitle = null;
+        for (let attempt = 0; attempt < 2 && !ogVideoUrl && ogImages.length === 0; attempt++) {
+            try {
+                const res = await axios.get(url, { timeout: 20000, maxRedirects: 10, headers: { 'User-Agent': 'Mozilla/5.0' } });
+                const possible = res?.request?.res?.responseUrl;
+                if (possible && typeof possible === 'string') {
+                    resolvedUrl = possible;
+                }
+
+                const html = typeof res.data === 'string' ? res.data : '';
+                ogVideoUrl = extractOg(html, 'og:video:secure_url|og:video:url|og:video');
+                ogTitle = extractOg(html, 'og:title');
+                ogImages = [...new Set(extractOgAll(html, 'og:image:secure_url|og:image:url|og:image'))];
+            } catch {
+                // ignore resolution errors; use original url / retry
+            }
+        }
+
+        // Reels never carry an og:video tag in their static HTML at all (it's
+        // pure JS/GraphQL-rendered), so absence of og:video is meaningless for
+        // them - only trust the photo heuristic when the URL isn't shaped like
+        // a video/reel link in the first place. Facebook's own share links
+        // encode this too: /share/v/... is a video/reel share.
+        const looksLikeVideoUrl = /\/share\/v\/|\/reels?\/|\/videos?\/|\/watch(\/|\?|$)/i.test(url) ||
+            /\/reels?\/|\/videos?\/|\/watch(\/|\?|$)/i.test(resolvedUrl);
+
+        // Photo post: no og:video tag but has og:image(s) - send the photo(s)
+        // directly instead of running the video-download API chain, which
+        // otherwise returns an unrelated random video for non-video posts.
+        if (!ogVideoUrl && ogImages.length > 0 && !looksLikeVideoUrl) {
+            const caption = ogTitle ? `𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗗 𝗕𝗬 𝗡𝗶𝗴𝗵𝘁𝗛𝘂𝗻𝘁𝗲𝗿-𝗕𝗢𝗧\n\n📝 Title: ${ogTitle}` : "𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗗 𝗕𝗬 𝗡𝗶𝗴𝗵𝘁𝗛𝘂𝗻𝘁𝗲𝗿-𝗕𝗢𝗧";
+            for (let i = 0; i < ogImages.length; i++) {
+                await sock.sendMessage(chatId, {
+                    image: { url: ogImages[i] },
+                    caption: i === ogImages.length - 1 ? caption : undefined
+                }, { quoted: message });
+            }
+            return;
+        }
+
+        // Use Siputzx API
+        async function fetchFromApi(u) {
+            const apiUrl = `https://api.siputzx.my.id/api/d/facebook?url=${encodeURIComponent(u)}`;
+
+            try {
+                const response = await axios.get(apiUrl, {
+                    timeout: 20000,
+                    headers: {
+                        'accept': '*/*',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    },
+                    maxRedirects: 5,
+                    validateStatus: s => s >= 200 && s < 500
+                });
+
+                if (response.data) {
+                    // Accept response if status is true, or if response has data/result/url fields
+                    if (response.data.status === true ||
+                        response.data.result ||
+                        response.data.data ||
+                        response.data.url ||
+                        response.data.download ||
+                        response.data.video) {
+                        return { response, apiName: 'Siputzx API' };
+                    }
+                }
+            } catch (error) {
+                console.error(`Siputzx API failed: ${error.message}`);
+            }
+            throw new Error('Siputzx API failed');
+        }
+
+        // Try resolved URL, then fallback to original URL
+        let apiResult;
+        try {
+            apiResult = await fetchFromApi(resolvedUrl);
+        } catch {
+            apiResult = await fetchFromApi(url);
+        }
+
+        const response = apiResult.response;
+        const apiName = apiResult.apiName;
+        const data = response.data;
+
+        let fbvid = null;
+        let title = null;
+
+        // Handle Hanggts API response format
+        // Try parsing even if status is not explicitly true
+        if (data) {
+            // Try different possible response structures
+            if (data.result) {
+                // Hanggts API format: data.result.media.video_hd or video_sd
+                if (data.result.media) {
+                    // Prefer HD, fallback to SD
+                    fbvid = data.result.media.video_hd || data.result.media.video_sd;
+                    title = data.result.info?.title || data.result.title || data.title || "Facebook Video";
+                }
+                // Check if result is an object with url
+                else if (typeof data.result === 'object' && data.result.url) {
+                    fbvid = data.result.url;
+                    title = data.result.title || data.result.caption || data.title || "Facebook Video";
+                } 
+                // Check if result is a string (direct URL)
+                else if (typeof data.result === 'string' && data.result.startsWith('http')) {
+                    fbvid = data.result;
+                    title = data.title || "Facebook Video";
+                }
+                // Check if result has download or video property
+                else if (data.result.download) {
+                    fbvid = data.result.download;
+                    title = data.result.title || data.title || "Facebook Video";
+                } else if (data.result.video) {
+                    fbvid = data.result.video;
+                    title = data.result.title || data.title || "Facebook Video";
+                }
+            }
+            
+            if (!fbvid && data.data) {
+                if (Array.isArray(data.data.downloads) && data.data.downloads.length > 0) {
+                    // Siputzx API format: data.data.downloads[].{quality, type, url}
+                    const hd = data.data.downloads.find(item => /hd/i.test(item.quality || '') && item.type === 'video');
+                    const sd = data.data.downloads.find(item => /sd/i.test(item.quality || '') && item.type === 'video');
+                    fbvid = hd?.url || sd?.url || data.data.downloads.find(item => item.type === 'video')?.url || data.data.downloads[0]?.url;
+                    title = data.data.title || data.title || "Facebook Video";
+                } else if (typeof data.data === 'object' && data.data.url) {
+                    fbvid = data.data.url;
+                    title = data.data.title || data.data.caption || data.title || "Facebook Video";
+                } else if (typeof data.data === 'string' && data.data.startsWith('http')) {
+                    fbvid = data.data;
+                    title = data.title || "Facebook Video";
+                } else if (Array.isArray(data.data) && data.data.length > 0) {
+                    // Array format - find best quality
+                    const hdVideo = data.data.find(item => (item.quality === 'HD' || item.quality === 'high') && (item.format === 'mp4' || !item.format));
+                    const sdVideo = data.data.find(item => (item.quality === 'SD' || item.quality === 'low') && (item.format === 'mp4' || !item.format));
+                    fbvid = hdVideo?.url || sdVideo?.url || data.data[0]?.url;
+                    title = hdVideo?.title || sdVideo?.title || data.data[0]?.title || data.title || "Facebook Video";
+                } else if (data.data.download) {
+                    fbvid = data.data.download;
+                    title = data.data.title || data.title || "Facebook Video";
+                } else if (data.data.video) {
+                    fbvid = data.data.video;
+                    title = data.data.title || data.title || "Facebook Video";
+                }
+            }
+            
+            if (!fbvid && data.url) {
+                fbvid = data.url;
+                title = data.title || data.caption || "Facebook Video";
+            }
+            
+            if (!fbvid && data.download) {
+                fbvid = data.download;
+                title = data.title || "Facebook Video";
+            }
+            
+            if (!fbvid && data.video) {
+                if (typeof data.video === 'string') {
+                    fbvid = data.video;
+                } else if (data.video.url) {
+                    fbvid = data.video.url;
+                }
+                title = data.title || data.video.title || "Facebook Video";
+            }
+        }
+
+        if (!fbvid) {
+            return await sock.sendMessage(chatId, { 
+                text: '❌ Failed to get video URL from Facebook.\n\nPossible reasons:\n• Video is private or deleted\n• Link is invalid\n• Video is not available for download\n\nPlease try a different Facebook video link.'
+            }, { quoted: message });
+        }
+
+        // Try URL method first (more reliable)
+        try {
+            const caption = title ? `𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗗 𝗕𝗬 𝗡𝗶𝗴𝗵𝘁𝗛𝘂𝗻𝘁𝗲𝗿-𝗕𝗢𝗧\n\n📝 Title: ${title}` : "𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗗 𝗕𝗬 𝗡𝗶𝗴𝗵𝘁𝗛𝘂𝗻𝘁𝗲𝗿-𝗕𝗢𝗧";
+            
+            await sock.sendMessage(chatId, {
+                video: { url: fbvid },
+                mimetype: "video/mp4",
+                caption: caption
+            }, { quoted: message });
+            
+            return;
+        } catch (urlError) {
+            console.error(`URL method failed: ${urlError.message}`);
+            
+            // Fallback to buffer method
+            try {
+                // Create temp directory if it doesn't exist
+                const tmpDir = path.join(process.cwd(), 'tmp');
+                if (!fs.existsSync(tmpDir)) {
+                    fs.mkdirSync(tmpDir, { recursive: true });
+                }
+
+                // Generate temp file path
+                const tempFile = path.join(tmpDir, `fb_${Date.now()}.mp4`);
+
+                // Download the video
+                const videoResponse = await axios({
+                    method: 'GET',
+                    url: fbvid,
+                    responseType: 'stream',
+                    timeout: 60000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                        'Referer': 'https://www.facebook.com/'
+                    }
+                });
+
+                const writer = fs.createWriteStream(tempFile);
+                videoResponse.data.pipe(writer);
+
+                await new Promise((resolve, reject) => {
+                    writer.on('finish', resolve);
+                    writer.on('error', reject);
+                });
+
+                // Check if file was downloaded successfully
+                if (!fs.existsSync(tempFile) || fs.statSync(tempFile).size === 0) {
+                    throw new Error('Failed to download video');
+                }
+
+                // Send the video
+                const caption = title ? `𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗗 𝗕𝗬 𝗡𝗶𝗴𝗵𝘁𝗛𝘂𝗻𝘁𝗲𝗿-𝗕𝗢𝗧\n\n📝 Title: ${title}` : "𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗗 𝗕𝗬 𝗡𝗶𝗴𝗵𝘁𝗛𝘂𝗻𝘁𝗲𝗿-𝗕𝗢𝗧";
+                
+                await sock.sendMessage(chatId, {
+                    video: { url: tempFile },
+                    mimetype: "video/mp4",
+                    caption: caption
+                }, { quoted: message });
+
+                // Clean up temp file
+                try {
+                    fs.unlinkSync(tempFile);
+                } catch (err) {
+                    console.error('Error cleaning up temp file:', err);
+                }
+                return;
+            } catch (bufferError) {
+                console.error(`Buffer method also failed: ${bufferError.message}`);
+                throw new Error('Both URL and buffer methods failed');
+            }
+        }
+
+    } catch (error) {
+        console.error('Error in Facebook command:', error);
+        await sock.sendMessage(chatId, { 
+            text: "An error occurred. API might be down. Error: " + error.message
+        }, { quoted: message });
+    }
+}
+
+module.exports = facebookCommand; 

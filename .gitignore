@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Runtime data
+tmp/
+temp/
+
+# Session files (WhatsApp auth credentials)
+session/
+
+# Bot runtime/state data (phone numbers, sudo lists, message counts, etc.)
+data/*.json
+!/data/owner.json
+data/saved_media/
+data/take_media/
+data/sesiAI/*.json
+!data/sesiAI/.gitkeep
+baileys_store.json
+
+# Environment variables
+.env
+
+# Log files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor directories and files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
